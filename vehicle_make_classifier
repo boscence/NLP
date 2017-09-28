@@ -1,0 +1,249 @@
+
+# coding: utf-8
+
+# In[1]:
+
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.feature_extraction.text import TfidfTransformer
+from sklearn.feature_extraction.text import CountVectorizer
+import pandas as pd
+import numpy as np
+from sklearn.cross_validation import train_test_split
+from sklearn.cross_validation import cross_val_score
+from sklearn.metrics import f1_score
+from sklearn.metrics import classification_report
+from sklearn.externals import joblib
+# In[2]:
+'''
+from azureml import Workspace
+ws = Workspace()
+ds = ws.datasets[xxxxx]
+frame = ds.to_dataframe()
+'''
+#df= pd.read_csv('xxxxx.tsv', sep='\t')
+df= pd.read_csv('xxxx.csv',sep=',', encoding = 'latin')
+df = df.drop('Unnamed: 0', axis = 1)
+df.columns = ['MODEL', 'MODELDESCRIPTION', 'DESCRIPTION', 'NORM_MOD', 'NORM_MAKE','SEC', 'MODELYEAR']
+
+
+# In[3]:
+
+#########
+# Data Preparation
+# Here we prepare the data by removing nulls and concatenating text
+#########
+
+def load_prep_data():
+    global df_modeln, df_model
+
+    #df_model = pd.read_csv('xxx.csv', sep= ',',encoding = 'latin',names = cols_use,skiprows=1)
+
+    # Print the dimensions
+    print('Rows',len(df))
+    df_modeln = df.dropna()
+    
+    # Combine the vehicle description with the other local codes to create one text
+    text = df_modeln['MODEL'].str.cat(df_modeln['MODELDESCRIPTION'],sep=' ')
+    df_modeln['text'] = text.str.cat(df_modeln['DESCRIPTION'],sep=' ').str.lower()
+    #df_modeln['text'] = df_modeln['text'].str.replace('\-', ' ')
+    #df_modeln = df_modeln[0:limit] 
+    
+    print('Rows',len(df_modeln))
+
+load_prep_data()
+
+
+# In[4]:
+
+#########
+#Train test split
+#########
+def train_test():
+    global train, test
+    # Here we split the data into the train and test set and print their dimensions
+    msk = np.random.rand(len(df_modeln)) < 0.90
+    train = df_modeln[msk]
+    test = df_modeln[~msk]
+    #train, test = train_test_split(df_modeln, test_size=0.10)
+    print('Train:',train.shape)
+    print('Test:',test.shape)
+train_test()
+
+
+# In[4]:
+
+#########
+# Balance the data
+# In this multiclass classification issues we have imbalanced classes
+# So in this phase need to rebalance (remember, you can only rebalance the train set)
+# otherwise, you pollute the test set
+# So we reduce common classes to 'reduce to' and then replicate infrequent classes to 
+#########
+def train_test_balance(reduce_to, increase_to):
+    global balanced_train
+    #now we balance the train set
+    classes = set([i for i in train['NORM_MAKE']])
+    #balanced_train = pd.DataFrame(columns=train.columns)
+    #balanced_train = pd.DataFrame()
+    dfs = []
+    for i in classes:
+        df_class_subset = train[train['NORM_MAKE']==i]
+
+        if len(df_class_subset) >= reduce_to:
+            df_class_subset_big= df_class_subset.sample(n=reduce_to)
+            dfs.append(df_class_subset_big)
+        elif len(df_class_subset) < 20: 
+            while len(df_class_subset) < increase_to:
+                df_class_subset = df_class_subset.append(df_class_subset) 
+            dfs.append(df_class_subset)
+        else:
+            dfs.append(df_class_subset)
+
+    balanced_train = pd.concat(dfs, ignore_index=True)
+    print('Train Balanced:',balanced_train.shape)
+
+    # this fixes the VW training data that is not labelled as VOLKSWAGEN
+    # Doing this is dangerous but useful in this scenario
+    balanced_train.loc[balanced_train['text'].str.contains("vw"), 'NORM_MAKE'] = 'VOLKSWAGEN'
+    balanced_train[balanced_train['text'].str.contains("vw")]
+train_test_balance(5000, 1000)
+# In[5]:
+
+def feature_building():
+####################################
+##### Build the features going into the model
+####################################
+    global train, test, X_train_tfidf,X_new_tfidf,count_vect_fit,X_train_counts
+    global count_vect,tfidf_transformer_train,tfidf_fit
+
+
+    # Here we get the frequencies of each word and each uni-gram for the train set
+    count_vect = CountVectorizer(ngram_range=(1, 1),token_pattern=r"\b\w+\b",min_df=15)
+    count_vect_fit = count_vect.fit(balanced_train.text)
+    X_train_counts = count_vect.fit_transform(balanced_train.text)
+    print(X_train_counts.shape)
+
+    # Now we get the TFIDF for each word and bi-gram for the train set
+    tfidf_transformer_train = TfidfTransformer()
+    tfidf_fit = tfidf_transformer_train.fit(X_train_counts)
+    X_train_tfidf = tfidf_transformer_train.fit_transform(X_train_counts)
+    print(X_train_tfidf.shape)
+
+    # Now we get the TFIDF for each word and bi-gram for the test set
+    X_new_counts = count_vect.transform(test.text)
+    X_new_tfidf = tfidf_transformer_train.transform(X_new_counts)
+    print(type(X_train_counts))
+feature_building()
+
+
+# In[6]:
+
+def make_nb():
+    global clf_make_mnb,predictedmake_mnb
+####################################
+##### We do a quick Naive Bayes model here
+####################################
+    clf_make_mnb = MultinomialNB().fit(X_train_tfidf, balanced_train.NORM_MAKE)
+    predictedmake_mnb = clf_make_mnb.predict(X_new_tfidf)
+    
+    print("\nNaive Bayes: Number of mislabeled makes out of a total %d points : %d"
+          % (len(test.NORM_MAKE),(test.NORM_MAKE != predictedmake_mnb).sum()))
+    print((test.NORM_MAKE != predictedmake_mnb).sum()/float(len(test.NORM_MAKE)),'wrong')
+    print((test.NORM_MAKE == predictedmake_mnb).sum()/float(len(test.NORM_MAKE)),'accurate')
+make_nb()
+
+
+# In[15]:
+
+####################################
+##### Cross validate the scores
+####################################
+
+scores = cross_val_score(clf_make_mnb, X_new_tfidf, test.NORM_MAKE, cv=10)
+scores.mean()
+
+
+# In[12]:
+####################################
+##### Get the F1 Score
+####################################
+
+f1_score(test.NORM_MAKE, predictedmake_mnb, average='macro')  
+
+f1_score(test.NORM_MAKE, predictedmake_mnb, average='micro')  
+
+#f1_score(test.NORM_MAKE, predictedmake_mnb, average='weighted')  
+
+#f1_score(test.NORM_MAKE, predictedmake_mnb, average=None)
+
+
+# In[17]:
+
+####################################
+##### Examine results by class
+####################################
+
+cr = classification_report(test.NORM_MAKE, predictedmake_mnb)
+print(cr)
+
+# In[37]:
+
+####################################
+##### This function allows you to run a small test
+####################################
+
+def user_defined(a):
+    string_data = [a]
+    user_counts = count_vect.transform(string_data)
+    user_tfidf = tfidf_transformer_train.fit_transform(user_counts)
+    pred = str(clf_make_mnb.predict(user_tfidf)[0])
+    prob = str([max(i) for i in clf_make_mnb.predict_proba(user_tfidf)])
+    pred_prob = str(prob)
+    return pred+':'+pred_prob
+user_defined('Class')
+
+
+# In[15]:
+'''
+from azureml import services
+#Use your own workspace information below!
+service_id = xxx.service.service_id
+@services.service_id(service_id)
+@services.publish('xxx', 'xxx')
+@services.types(strings=unicode)
+@services.returns(unicode)
+def make_classifier_CM(strings):
+    string_data = [unicode(strings)]
+    user_counts = count_vect.transform(string_data)
+    user_tfidf = tfidf_transformer_train.fit_transform(user_counts)
+    result = str(clf_make_mnb.predict(user_tfidf)[0])
+    return unicode(result)
+'''
+
+
+# In[37]:
+####################################
+##### Here we export the model and its related models to a file
+####################################
+
+
+joblib.dump(tfidf_fit, 'xxx\\make_classifier_tfidf.pkl',compress = 2)
+joblib.dump(count_vect_fit, 'xxx\\make_classifier_count_vectoriser.pkl',compress = 2)
+joblib.dump(clf_make_mnb, 'xxx\\make_classifier.pkl',compress = 2)
+
+# In[37]:
+####################################
+##### This is an example of using the model
+####################################
+'''
+
+new_data = 'vw golf tdi 90tsi'
+a = joblib.load('xxx\\make_classifier_count_vectoriser.pkl')
+b = joblib.load('xxx\\make_classifier_tfidf.pkl')
+c = joblib.load('xxx\\make_classifier.pkl')
+
+x=a.transform([new_data])
+y=b.transform(x)
+z=c.predict(y)
+print(z)
+'''
